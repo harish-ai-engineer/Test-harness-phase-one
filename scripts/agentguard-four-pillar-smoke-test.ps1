@@ -593,6 +593,69 @@ if (-not $send.Ok) {
   }
 }
 
+# GOV-01b: SDK-level PII redaction (Microsoft Presidio). Drives the AgentGuard
+# gateway SDK's PIIGuardrail directly - the same Presidio engine the gateway runs
+# inline - and asserts raw PII is replaced with placeholders. Mirrors the
+# dashboard's "Test this guardrail" panel. Requires the gateway SDK installed in
+# the local venv (.venv-gateway); skipped otherwise.
+$venvPy = Join-Path $PSScriptRoot "..\.venv-gateway\Scripts\python.exe"
+if (-not (Test-Path $venvPy)) {
+  Report-Skip "GOV-01b" "SDK PII redaction - gateway SDK venv not found (.venv-gateway); see setup notes"
+} else {
+  $gwText = "Hi, I'm Rahul Menon. Reach me at rahul@xploro.io or +91-98765-43210. My card is 4111 1111 1111 1111."
+  $gwRaw  = @("rahul@xploro.io", "+91-98765-43210", "4111 1111 1111 1111")
+  $gwPlaceholders = @("<EMAIL_ADDRESS>", "<PHONE_NUMBER>", "<CREDIT_CARD>")
+
+  # Tiny Python driver written to a temp file (robust quoting) that runs the
+  # PIIGuardrail and emits a single JSON line prefixed with a marker.
+  $pyCode = @'
+import json, sys
+from litellm_sdkmode.gaurdrail import PIIGuardrail
+text = sys.argv[1]
+r = PIIGuardrail().execute(text)
+print("AGRESULT::" + json.dumps({
+    "text": getattr(r, "text", ""),
+    "status": getattr(r, "status", None),
+    "entities": getattr(r, "entities_detected", []),
+}))
+'@
+  $pyFile = Join-Path ([IO.Path]::GetTempPath()) "ag_pii_$RunSuffix.py"
+  Set-Content -Path $pyFile -Value $pyCode -Encoding UTF8
+
+  try {
+    # The SDK writes model-load chatter to stderr; redirect it to a temp file and
+    # relax ErrorActionPreference so that stderr is not promoted to a terminating
+    # error (the runner sets -ErrorAction Stop).
+    $errFile = Join-Path ([IO.Path]::GetTempPath()) "ag_pii_${RunSuffix}.err"
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $raw = & $venvPy $pyFile $gwText 2>$errFile
+    $ErrorActionPreference = $prevEAP
+    Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+    $line = ($raw | Select-String -Pattern "^AGRESULT::" | Select-Object -First 1)
+    if (-not $line) {
+      Report-Fail "GOV-01b" "SDK PII redaction - guardrail produced no result (SDK error)"
+    } else {
+      $json = ($line.ToString()).Substring("AGRESULT::".Length)
+      $res = $json | ConvertFrom-Json
+      $redacted = "$($res.text)"
+      $rawPresent = $false
+      foreach ($p in $gwRaw) { if ($redacted -like "*$p*") { $rawPresent = $true } }
+      $hasPlaceholder = $false
+      foreach ($ph in $gwPlaceholders) { if ($redacted -like "*$ph*") { $hasPlaceholder = $true } }
+      if ($rawPresent) {
+        Report-Fail "GOV-01b" "SDK PII redaction - raw PII still present after guardrail: $redacted"
+      } elseif (-not $hasPlaceholder) {
+        Report-Fail "GOV-01b" "SDK PII redaction - no placeholders found in: $redacted"
+      } else {
+        Report-Pass "GOV-01b" "SDK PII redaction (Presidio replaced email/phone/card; entities: $($res.entities -join ','))"
+      }
+    }
+  } finally {
+    Remove-Item $pyFile -Force -ErrorAction SilentlyContinue
+  }
+}
+
 # GOV-02: Prompt injection marker trace. NOTE: this only verifies a
 # jailbreak-style input round-trips through ingestion intact - the public API
 # exposes no detection/blocking result to assert on, so this is NOT a test
@@ -609,10 +672,16 @@ if (-not $send.Ok) {
   Report-Fail "GOV-02" "Prompt injection marker trace (not a detection/blocking test) - ingestion request failed: $($send.Error)"
 } else {
   $trace = Wait-ForTrace $gov02TraceId
-  if ($trace -and $trace.input -eq $injectionInput -and $trace.tags -contains "prompt-injection-marker") {
+  # NOTE: we intentionally do NOT require the stored input to be byte-identical
+  # to what we sent - an active guardrail (PII redaction, injection defense) may
+  # legitimately rewrite/redact the input. We only assert the trace is visible
+  # and carries the injection marker tag.
+  if ($trace -and ($trace.tags -contains "prompt-injection-marker")) {
     Report-Pass "GOV-02" "Prompt injection marker trace (marker only - not a detection/blocking assertion)"
+  } elseif ($trace) {
+    Report-Fail "GOV-02" "Prompt injection marker trace (not a detection/blocking test) - trace visible but injection marker tag missing"
   } else {
-    Report-Fail "GOV-02" "Prompt injection marker trace (not a detection/blocking test) - trace not visible with expected content within ${TimeoutSeconds}s"
+    Report-Fail "GOV-02" "Prompt injection marker trace (not a detection/blocking test) - trace not visible within ${TimeoutSeconds}s"
   }
 }
 
@@ -654,8 +723,23 @@ if (-not $send.Ok) {
   }
 }
 
-# GOV-04: Access control / RBAC check
-Report-Skip "GOV-04" "RBAC check - test user not configured (no second scoped API key supplied)"
+# GOV-04: Access control / cross-project authorization check.
+# Asserts the secondary project's key CANNOT read the primary project's
+# evaluation score (EVAL-01). This is a real authorization assertion on a
+# different object type than GOV-03 (which covers traces). Skips only when no
+# secondary key is supplied.
+if (-not $HasSecondaryKey) {
+  Report-Skip "GOV-04" "Access control - no secondary API key supplied (set -SecondaryPublicKey/-SecondarySecretKey)"
+} elseif (-not $eval01ScoreId) {
+  Report-Fail "GOV-04" "Access control - no primary-project score available to test against" $false
+} else {
+  $crossScoreFetch = Invoke-AgGet "/api/public/v2/scores/$eval01ScoreId" $SecondaryHeaders
+  if (-not $crossScoreFetch.Ok) {
+    Report-Pass "GOV-04" "Access control (secondary project key denied access to primary project's score)"
+  } else {
+    Report-Fail "GOV-04" "Access control - primary project's score was readable using the secondary project's key"
+  }
+}
 
 # GOV-05: Audit trail / activity tracking
 Report-Skip "GOV-05" "Audit trail - API not available (no public read endpoint)"

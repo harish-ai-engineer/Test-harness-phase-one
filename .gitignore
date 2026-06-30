@@ -1,2 +1,5 @@
 # Local secrets — never commit real keys
 scripts/smoke-test.config.ps1
+
+# Gateway SDK virtualenv
+.venv-gateway/
