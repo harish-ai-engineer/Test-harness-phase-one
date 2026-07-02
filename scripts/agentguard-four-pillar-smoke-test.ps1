@@ -1,34 +1,61 @@
 <#
 .SYNOPSIS
-  AgentGuard four-pillar smoke test: Observability, Prompt Management, Evaluations, Security & Governance.
+  AgentGuard four-pillar smoke test (single, self-contained script):
+  Observability, Prompt Management, Evaluations, Datasets & Experiments,
+  and Security & Governance.
 
 .DESCRIPTION
-  Calls AgentGuard's public HTTP API (Basic Auth, public/secret key) to exercise each pillar end to end.
-  No UI automation. Tests that depend on functionality not exposed via the public API are reported as
-  SKIP with a documented reason instead of being faked as PASS.
+  Exercises AgentGuard end to end over its public HTTP API (Basic Auth) plus the
+  agentguard-sdk gateway guardrails and an LLM-as-a-Judge loop. No UI automation.
+  Anything not reachable via the public API is reported as SKIP with a reason,
+  never faked as PASS.
+
+  This is ONE file - no runner or config file is required. Provide credentials
+  via parameters or environment variables (see README.md).
+
+.PARAMETER BaseUrl
+  AgentGuard base URL, e.g. https://your-agentguard.example.com  (env: AG_BASE_URL)
+
+.PARAMETER PublicKey / SecretKey
+  Project API key pair from AgentGuard project settings.  (env: AG_PUBLIC_KEY / AG_SECRET_KEY)
+
+.PARAMETER PythonExe
+  Python interpreter that has agentguard-sdk (litellm_sdkmode) installed. Needed
+  only for the SDK guardrail tests and the LLM-as-a-Judge tests; those SKIP if it
+  is missing. Defaults to a package .venv if present, else "python" on PATH.
+  (env: AG_SMOKE_PYTHON)
+
+.EXAMPLE
+  # Env vars set once, then:
+  ./Invoke-AgentGuardSmokeTest.ps1
+
+.EXAMPLE
+  ./Invoke-AgentGuardSmokeTest.ps1 -BaseUrl https://ag.example.com -PublicKey pk-... -SecretKey sk-...
 #>
 
 param(
-  [string]$BaseUrl = "http://localhost:3001",
+  [string]$BaseUrl = $(if ($env:AG_BASE_URL) { $env:AG_BASE_URL } else { "http://localhost:3001" }),
   [string]$PublicKey = $env:AG_PUBLIC_KEY,
   [string]$SecretKey = $env:AG_SECRET_KEY,
   [string]$ProjectId = "",
-  [string]$Environment = "default",
-  [int]$TimeoutSeconds = 60,
+  [string]$Environment = $(if ($env:AG_ENVIRONMENT) { $env:AG_ENVIRONMENT } else { "smoke" }),
+  [int]$TimeoutSeconds = $(if ($env:AG_TIMEOUT_SECONDS) { [int]$env:AG_TIMEOUT_SECONDS } else { 120 }),
   [string]$TestRunId = ("run-" + (Get-Date -Format "yyyyMMddHHmmss")),
-  # Optional second project's key pair, used to strengthen GOV-03 into a real
-  # cross-project isolation check instead of a within-project filter check.
+  # Optional second project's key pair, used to strengthen GOV-03/GOV-04 into a
+  # real cross-project isolation check instead of a within-project filter check.
   [string]$SecondaryPublicKey = $env:AG_SECONDARY_PUBLIC_KEY,
   [string]$SecondarySecretKey = $env:AG_SECONDARY_SECRET_KEY,
-  # Optional LLM key/model for the LLM-as-a-Judge evaluations (EVAL-05/06).
+  # Optional LLM key/model for the LLM-as-a-Judge evaluations (EVAL-05/06/07).
   # litellm model string, e.g. "gemini/gemini-2.5-flash" or "gpt-4o-mini".
   # When no key is supplied, the judge tests are skipped (not failed).
-  [string]$JudgeApiKey = $env:GEMINI_API_KEY,
-  [string]$JudgeModel  = "gemini/gemini-2.5-flash"
+  [string]$JudgeApiKey = $(if ($env:JUDGE_API_KEY) { $env:JUDGE_API_KEY } elseif ($env:GEMINI_API_KEY) { $env:GEMINI_API_KEY } else { $env:OPENAI_API_KEY }),
+  [string]$JudgeModel  = $(if ($env:JUDGE_MODEL) { $env:JUDGE_MODEL } else { "gemini/gemini-2.5-flash" }),
+  # Python interpreter with agentguard-sdk installed (SDK guardrail + judge tests).
+  [string]$PythonExe = ""
 )
 
 if ([string]::IsNullOrWhiteSpace($PublicKey) -or [string]::IsNullOrWhiteSpace($SecretKey)) {
-  Write-Error "Missing keys. Set AG_PUBLIC_KEY and AG_SECRET_KEY (or pass -PublicKey / -SecretKey)."
+  Write-Error "Missing keys. Set AG_PUBLIC_KEY and AG_SECRET_KEY (or pass -PublicKey / -SecretKey). See README.md."
   exit 1
 }
 
@@ -57,8 +84,35 @@ $TenantId   = "customer-$((Get-Random -InputObject $CustomerSlugs))-$RunSuffix"
 $BusinessId = "workspace-$((Get-Random -InputObject $WorkflowSlugs))-$RunSuffix"
 $Source     = "agentguard-api-validation"
 
-# Gateway SDK venv (used by the SDK guardrail tests and the LLM-as-a-Judge tests).
-$venvPy = Join-Path $PSScriptRoot "..\.venv-gateway\Scripts\python.exe"
+# ---------------------------------------------------------------------------
+# Resolve the Python interpreter for the SDK guardrail + LLM-as-a-Judge tests.
+# Order: -PythonExe / AG_SMOKE_PYTHON -> a package-local .venv -> "python" on PATH.
+# Those tests SKIP (never fail) when no suitable interpreter/module is present.
+# ---------------------------------------------------------------------------
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+  if ($env:AG_SMOKE_PYTHON) {
+    $PythonExe = $env:AG_SMOKE_PYTHON
+  } else {
+    $venvCandidates = @(
+      (Join-Path $PSScriptRoot "..\..\.venv\Scripts\python.exe"),  # package root .venv (Windows)
+      (Join-Path $PSScriptRoot "..\..\.venv\bin\python"),          # package root .venv (POSIX)
+      (Join-Path $PSScriptRoot "..\.venv-gateway\Scripts\python.exe")
+    )
+    $found = $venvCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $PythonExe = if ($found) { $found } else { "python" }
+  }
+}
+
+function Test-PyModule([string]$Module) {
+  try {
+    & $PythonExe -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('$Module') else 1)" 2>$null
+    return ($LASTEXITCODE -eq 0)
+  } catch { return $false }
+}
+
+# The SDK guardrail tests need litellm_sdkmode; the judge tests also need litellm.
+$SdkGuardAvailable = Test-PyModule "litellm_sdkmode"
+$JudgeAvailable    = $SdkGuardAvailable -and (Test-PyModule "litellm") -and -not [string]::IsNullOrWhiteSpace($JudgeApiKey)
 
 $script:Results = @()
 
@@ -323,6 +377,28 @@ function Send-OtelSpans([array]$Spans) {
     })
   }
   return Invoke-AgPost "/api/public/otel/v1/traces" $payload
+}
+
+# Builds the guardrail audit JSON the gateway writes to the
+# `agentguard.trace.metadata.guardrails` attribute. Setting that attribute on a
+# trace makes it appear under the matching guardrail's Traces tab in the
+# Guardrails section (the view filters on metadata.guardrails[].name).
+function New-GuardrailAuditJson {
+  param(
+    [string]$Name, [string]$Status, [string]$Action,
+    [double]$RiskScore, [double]$Threshold, [string[]]$Entities, [string]$Sanitized
+  )
+  $entry = [ordered]@{
+    name              = $Name
+    status            = $Status
+    action            = $Action
+    risk_score        = $RiskScore
+    threshold         = $Threshold
+    entities_detected = @($Entities)
+    sanitized_prompt  = $Sanitized
+    timestamp         = (New-Iso8601Timestamp)
+  }
+  return (ConvertTo-Json @($entry) -Depth 6 -Compress)
 }
 
 # ---------------------------------------------------------------------------
@@ -967,9 +1043,9 @@ Report-Skip "EVAL-04" "Native LLM-as-a-Judge evaluator - API not available (eval
 #     judge's score is written to a trace and read back.
 #   EVAL-06 (NEGATIVE): an incorrect answer must score LOW (<= 0.3), proving the
 #     judge discriminates instead of rubber-stamping. Both share one judge call.
-if (-not (Test-Path $venvPy)) {
-  Report-Skip "EVAL-05" "LLM-as-a-Judge (positive) - gateway SDK venv not found (.venv-gateway)"
-  Report-Skip "EVAL-06" "LLM-as-a-Judge (negative) - gateway SDK venv not found (.venv-gateway)"
+if (-not $SdkGuardAvailable) {
+  Report-Skip "EVAL-05" "LLM-as-a-Judge (positive) - agentguard-sdk not importable by '$PythonExe'"
+  Report-Skip "EVAL-06" "LLM-as-a-Judge (negative) - agentguard-sdk not importable by '$PythonExe'"
 } elseif ([string]::IsNullOrWhiteSpace($JudgeApiKey)) {
   Report-Skip "EVAL-05" "LLM-as-a-Judge (positive) - no LLM key supplied (set JudgeApiKey / GEMINI_API_KEY)"
   Report-Skip "EVAL-06" "LLM-as-a-Judge (negative) - no LLM key supplied (set JudgeApiKey / GEMINI_API_KEY)"
@@ -978,7 +1054,7 @@ if (-not (Test-Path $venvPy)) {
   $goodAnswer   = "Confirm the duplicate charge, refund the extra charge to the original payment method, and email the customer a confirmation with the expected settlement time."
   $badAnswer    = "Tell the customer that duplicate charges are their own responsibility and cannot be refunded."
 
-  $judge = Invoke-LlmJudge -PythonExe $venvPy -ApiKey $JudgeApiKey -Model $JudgeModel -Cases @(
+  $judge = Invoke-LlmJudge -PythonExe $PythonExe -ApiKey $JudgeApiKey -Model $JudgeModel -Cases @(
     @{ label = "good"; request = $judgeRequest; answer = $goodAnswer },
     @{ label = "bad";  request = $judgeRequest; answer = $badAnswer }
   )
@@ -1028,8 +1104,8 @@ if (-not (Test-Path $venvPy)) {
 # the Basic-Auth public API. This runs the same named evaluators over a trace via
 # the judge and persists each verdict as a named score - the same observable
 # result (named evaluator scores on the trace) the managed run produces.
-if (-not (Test-Path $venvPy)) {
-  Report-Skip "EVAL-07" "Managed-evaluator panel run - gateway SDK venv not found (.venv-gateway)"
+if (-not $SdkGuardAvailable) {
+  Report-Skip "EVAL-07" "Managed-evaluator panel run - agentguard-sdk not importable by '$PythonExe'"
 } elseif ([string]::IsNullOrWhiteSpace($JudgeApiKey)) {
   Report-Skip "EVAL-07" "Managed-evaluator panel run - no LLM key supplied (set JudgeApiKey / GEMINI_API_KEY)"
 } else {
@@ -1044,7 +1120,7 @@ if (-not (Test-Path $venvPy)) {
   $evalRequest = "A customer was charged twice for order ORD-5521 and wants it fixed today. What should support do?"
   $evalAnswer  = "Confirm the duplicate charge, refund the extra charge to the original payment method, and email the customer a confirmation noting a 2-3 business day settlement."
 
-  $panel = Invoke-LlmEvaluatorPanel -PythonExe $venvPy -ApiKey $JudgeApiKey -Model $JudgeModel `
+  $panel = Invoke-LlmEvaluatorPanel -PythonExe $PythonExe -ApiKey $JudgeApiKey -Model $JudgeModel `
     -Request $evalRequest -AnswerText $evalAnswer -Context $evalContext -Evaluators $evaluators
 
   $names = @($evaluators | ForEach-Object { $_.name })
@@ -1180,8 +1256,8 @@ Report-Skip "GOV-01" "PII redaction at ingestion - not provided by the public in
 # SDK guardrail evaluation (agentguard-sdk gateway guardrails).
 # Run ALL guardrail cases in one process up front (model loads are slow), then
 # assert on the results below. Feeds: GOV-01b/c/d (PII), GOV-02b (injection),
-# GOV-07b (toxicity). Skipped per-test when the gateway SDK venv is absent.
-$SdkGuardAvailable = Test-Path $venvPy
+# GOV-07b (toxicity). Skipped per-test when agentguard-sdk is not importable by
+# $PythonExe (see $SdkGuardAvailable, resolved near the top of this script).
 $SdkGuard = @{}
 
 # Shared case fixtures (referenced by the assertions).
@@ -1205,13 +1281,13 @@ if ($SdkGuardAvailable) {
     @{ label = "tox_toxic";  guardrail = "tox"; text = $toxToxicText;  config = $toxBlock },
     @{ label = "tox_benign"; guardrail = "tox"; text = $toxBenignText; config = $toxBlock }
   )
-  $SdkGuard = Invoke-SdkGuardrails -PythonExe $venvPy -Cases $cases
+  $SdkGuard = Invoke-SdkGuardrails -PythonExe $PythonExe -Cases $cases
 }
 
 # GOV-01b: SDK PII redaction. Drives the gateway SDK's PIIGuardrail (Presidio)
 # and asserts real PII is replaced with placeholders (default "redact" action).
 if (-not $SdkGuardAvailable) {
-  Report-Skip "GOV-01b" "SDK PII redaction - gateway SDK venv not found (.venv-gateway); see setup notes"
+  Report-Skip "GOV-01b" "SDK PII redaction - agentguard-sdk not importable by the Python interpreter; see setup notes"
 } else {
   $res = $SdkGuard["pii_block"]
   if (-not $res) {
@@ -1234,7 +1310,7 @@ if (-not $SdkGuardAvailable) {
 # ALLOWED THROUGH untouched (status "passed", zero entities). Guards against
 # over-blocking / false positives.
 if (-not $SdkGuardAvailable) {
-  Report-Skip "GOV-01c" "Guardrail allow (positive) - gateway SDK venv not found (.venv-gateway)"
+  Report-Skip "GOV-01c" "Guardrail allow (positive) - agentguard-sdk not importable by the Python interpreter"
 } else {
   $res = $SdkGuard["pii_clean"]
   if (-not $res) {
@@ -1252,7 +1328,7 @@ if (-not $SdkGuardAvailable) {
 # carrying PII must be BLOCKED (status "blocked", body replaced with [REDACTED]),
 # not merely redacted. Exercises the config-driven block action.
 if (-not $SdkGuardAvailable) {
-  Report-Skip "GOV-01d" "Guardrail block (negative) - gateway SDK venv not found (.venv-gateway)"
+  Report-Skip "GOV-01d" "Guardrail block (negative) - agentguard-sdk not importable by the Python interpreter"
 } else {
   $res = $SdkGuard["pii_reject"]
   if (-not $res) {
@@ -1277,7 +1353,7 @@ if (-not $SdkGuardAvailable) {
 # records the findings (detected entity types). Reuses the real SDK result from
 # the GOV-01b run so the trace shows the exact transformation the gateway applies.
 if (-not $SdkGuardAvailable -or -not $SdkGuard["pii_block"]) {
-  Report-Skip "GOV-01e" "Guardrail redaction trace - gateway SDK venv/result not available (.venv-gateway)"
+  Report-Skip "GOV-01e" "Guardrail redaction trace - agentguard-sdk result not available"
 } else {
   $res          = $SdkGuard["pii_block"]
   $rawText      = $piiText
@@ -1332,6 +1408,59 @@ if (-not $SdkGuardAvailable -or -not $SdkGuard["pii_block"]) {
   }
 }
 
+# GOV-01f: Guardrail traces for the Guardrails section. Emits one "chat-request"
+# trace per guardrail (pii-redaction, prompt-injection, toxic-content) carrying
+# the same `agentguard.trace.metadata.guardrails` audit metadata the gateway
+# writes, built from the real SDK results. Each trace then appears under its
+# guardrail's Traces tab (the view filters on metadata.guardrails[].name).
+if (-not $SdkGuardAvailable -or -not $SdkGuard["pii_block"] -or -not $SdkGuard["inj_attack"] -or -not $SdkGuard["tox_toxic"]) {
+  Report-Skip "GOV-01f" "Guardrail traces (Guardrails view) - agentguard-sdk results not available"
+} else {
+  $piiR = $SdkGuard["pii_block"]; $injR = $SdkGuard["inj_attack"]; $toxR = $SdkGuard["tox_toxic"]
+  $guardrailTraces = @(
+    @{ guardrail = "pii-redaction";    input = $piiText;       output = "$($piiR.text)"
+       audit = (New-GuardrailAuditJson -Name "pii-redaction" -Status "$($piiR.status)" -Action "redact" -RiskScore 0 -Threshold 0 -Entities @($piiR.entities) -Sanitized "$($piiR.text)") },
+    @{ guardrail = "prompt-injection"; input = $injAttackText; output = "[REDACTED]"
+       audit = (New-GuardrailAuditJson -Name "prompt-injection" -Status "$($injR.status)" -Action "Block request (400)" -RiskScore ([double]$injR.risk_score) -Threshold 0.5 -Entities @() -Sanitized "[REDACTED]") },
+    @{ guardrail = "toxic-content";    input = $toxToxicText;  output = "[REDACTED]"
+       audit = (New-GuardrailAuditJson -Name "toxic-content" -Status "$($toxR.status)" -Action "Block request (400)" -RiskScore ([double]$toxR.risk_score) -Threshold 0.5 -Entities @() -Sanitized "[REDACTED]") }
+  )
+  $g01fHexes = @{}
+  foreach ($gt in $guardrailTraces) {
+    $hex = New-OtelHexId 16
+    $g01fHexes[$gt.guardrail] = $hex
+    $gStart = New-RecentUtcTime -MinAgeSeconds 20 -MaxAgeSeconds 120
+    $gAttrs = @{
+      "langfuse.trace.name"                  = "chat-request"
+      "langfuse.trace.user_id"               = $TenantId
+      "langfuse.trace.session_id"            = (New-SessionId)
+      "langfuse.trace.input"                 = $gt.input
+      "langfuse.trace.output"                = $gt.output
+      "langfuse.trace.metadata.testRunId"    = $TestRunId
+      "langfuse.trace.metadata.marker"       = "guardrail-view-$RunSuffix"
+      "agentguard.trace.metadata.guardrails" = $gt.audit
+    }
+    $gSpan = New-OtelSpan -TraceHex $hex -Name "chat-request" -Type "guardrail" `
+      -InputText $gt.input -Output $gt.output -StartTime $gStart -EndTime $gStart.AddMilliseconds(200) -TraceAttributes $gAttrs
+    $null = Send-OtelSpans @($gSpan)
+  }
+  # Verify each trace is visible AND carries its guardrail name in metadata.guardrails.
+  $g01fOk = 0
+  foreach ($gt in $guardrailTraces) {
+    $hex = $g01fHexes[$gt.guardrail]
+    $t = Wait-For -Check {
+      $r = Invoke-AgGet "/api/public/traces/$hex"
+      if ($r.Ok -and $r.Data.metadata.guardrails) { return $r.Data } else { return $null }
+    }
+    if ($t -and (@($t.metadata.guardrails | ForEach-Object { $_.name }) -contains $gt.guardrail)) { $g01fOk++ }
+  }
+  if ($g01fOk -eq $guardrailTraces.Count) {
+    Report-Pass "GOV-01f" "Guardrail traces (Guardrails view) - $g01fOk/3 visible with guardrail metadata (pii-redaction, prompt-injection, toxic-content)"
+  } else {
+    Report-Fail "GOV-01f" "Guardrail traces (Guardrails view) - only $g01fOk/3 traces carried the expected guardrail metadata"
+  }
+}
+
 # GOV-02: Prompt injection marker trace. NOTE: this only verifies a
 # jailbreak-style input round-trips through ingestion intact - the public API
 # exposes no detection/blocking result to assert on, so this is NOT a test
@@ -1366,7 +1495,7 @@ if (-not $send.Ok) {
 # and asserts it DISCRIMINATES: a benign request passes, a jailbreak attempt is
 # BLOCKED (status "blocked" under a block action). Positive + negative in one.
 if (-not $SdkGuardAvailable) {
-  Report-Skip "GOV-02b" "SDK prompt-injection detection - gateway SDK venv not found (.venv-gateway)"
+  Report-Skip "GOV-02b" "SDK prompt-injection detection - agentguard-sdk not importable by the Python interpreter"
 } else {
   $benign = $SdkGuard["inj_benign"]
   $attack = $SdkGuard["inj_attack"]
@@ -1467,7 +1596,7 @@ Report-Skip "GOV-07" "Toxic/harmful content blocking - API not available (no pub
 # SDK's ToxicContentGuardrail and asserts it DISCRIMINATES: a polite message
 # passes, an abusive message is BLOCKED (status "blocked" under a block action).
 if (-not $SdkGuardAvailable) {
-  Report-Skip "GOV-07b" "SDK toxic-content detection - gateway SDK venv not found (.venv-gateway)"
+  Report-Skip "GOV-07b" "SDK toxic-content detection - agentguard-sdk not importable by the Python interpreter"
 } else {
   $benign = $SdkGuard["tox_benign"]
   $toxic  = $SdkGuard["tox_toxic"]
