@@ -30,6 +30,8 @@ $params = @{
 }
 if ($Config.SecondaryPublicKey) { $params.SecondaryPublicKey = $Config.SecondaryPublicKey }
 if ($Config.SecondarySecretKey) { $params.SecondarySecretKey = $Config.SecondarySecretKey }
+if ($Config.JudgeApiKey)        { $params.JudgeApiKey        = $Config.JudgeApiKey }
+if ($Config.JudgeModel)         { $params.JudgeModel         = $Config.JudgeModel }
 
 & $testPath @params
 exit $LASTEXITCODE
